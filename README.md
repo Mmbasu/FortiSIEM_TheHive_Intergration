@@ -18,7 +18,7 @@ fortisiem-thehive-integration/
 
 ## 🔧 Features
 
-- Authenticates with FortiSIEM 7.3.1 using REST API
+- Authenticates with FortiSIEM 7.2.1 using REST API
 - Pulls recent high-severity events (severity > 3)
 - Converts each event to a structured alert
 - Sends alert to TheHive using its REST API
@@ -123,7 +123,7 @@ Add:
 
 ## 📚 References
 
-- [FortiSIEM API Docs (7.3.1)](https://docs.fortinet.com/document/fortisiem)
+- [FortiSIEM API Docs (7.2.1)](https://docs.fortinet.com/document/fortisiem)
 - [TheHive Technical Documentation](https://docs.strangebee.com)
 - [TheHive API Reference](https://docs.strangebee.com/thehive/api/overview/)
 

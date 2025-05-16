@@ -7,19 +7,31 @@ from datetime import datetime, timezone
 import re
 
 def parse_cef(cef_line):
-    """Parses FortiSIEM’s CEF log line into structured fields, and parses rawEvent into JSON"""
+    """
+    Parses a FortiSIEM CEF log line including prefix timestamp and IP, then parses the CEF content.
+    Returns a dictionary with prefix and parsed CEF data (including rawEvent JSON).
+    """
+    # Extract prefix before the actual CEF string
+    cef_start_index = cef_line.find("CEF:")
+    if cef_start_index == -1:
+        raise ValueError("No CEF section found in log line")
+
+    prefix = cef_line[:cef_start_index].strip()  # Removes the datetime preceeding the CEF "May 14 14:19:36 10.254.1.2"
+    cef_content = cef_line[cef_start_index:]     # "CEF: 0|Fortinet|..."
+
+    # Regex to match CEF header and extensions
     cef_regex = re.compile(
         r'CEF:\s*(?P<version>\d+)\|(?P<deviceVendor>[^|]*)\|(?P<deviceProduct>[^|]*)\|(?P<deviceVersion>[^|]*)\|(?P<signatureID>[^|]*)\|(?P<name>[^|]*)\|(?P<severity>[^|]*)\|(?P<extensions>.*)'
     )
 
-    match = cef_regex.match(cef_line.strip())
+    match = cef_regex.match(cef_content.strip())
     if not match:
-        raise ValueError("Invalid CEF format")
+        raise ValueError("Invalid CEF format after prefix")
 
     cef_dict = match.groupdict()
     extension_str = cef_dict["extensions"]
 
-    # Handle rawEvent separately to avoid breaking on embedded '='
+    # Parse the extension fields including rawEvent
     raw_event_split = extension_str.split("rawEvent=", 1)
 
     ext_fields = {}
@@ -29,21 +41,19 @@ def parse_cef(cef_line):
         before_raw_event = raw_event_split[0].strip()
         raw_event_value = raw_event_split[1].strip()
 
-        # Parse key=value pairs before rawEvent
         for m in re.finditer(r'(\w+)=([^\s]+)', before_raw_event):
             key, value = m.group(1), m.group(2)
             ext_fields[key] = value
 
         ext_fields["rawEvent"] = raw_event_value
     else:
-        # No rawEvent — parse entire extension string normally
         for m in re.finditer(r'(\w+)=([^\s]+)', extension_str):
             key, value = m.group(1), m.group(2)
             ext_fields[key] = value
 
     cef_dict["extensions"] = ext_fields
 
-    # Parse rawEvent XML into JSON if available
+    # Parse rawEvent (XML) into JSON
     if raw_event_value:
         print(f"Extracted rawEvent: {raw_event_value[:100]}...")
         parsed_raw_event = parse_raw_event(raw_event_value)
@@ -52,7 +62,11 @@ def parse_cef(cef_line):
         print("No rawEvent field extracted!")
         cef_dict["rawEvent_json"] = {}
 
-    return cef_dict
+    # Return result including original prefix
+    return {
+        "prefix": prefix,
+        "cef_data": cef_dict
+    }
 
 
 
@@ -68,7 +82,6 @@ def parse_raw_event(raw_event_str):
         print("No rawEvent content to parse!")
         return {}
 
-    # Debugging step: Print the cleaned raw_event_str
     print(f"Cleaned rawEvent string: {raw_event_str[:100]}...")  # Check the cleaned string
 
     # Make sure it's a valid XML: wrap in <root> if needed
@@ -90,31 +103,56 @@ def parse_raw_event(raw_event_str):
 
     return raw_event_dict
 
+def clean_prefix(prefix):
+    """ Removes the last section (SIEM IP address) from the prefix string."""
+    parts = prefix.strip().split()
+    if len(parts) >= 4:
+        return " ".join(parts[:-1])  # remove last element (IP)
+    return prefix
 
-def create_alert(cef_event):
-    """Converts parsed CEF data into a format TheHive understands"""
-    extensions = cef_event.get("extensions", {})
-    title = cef_event.get("name", "Unknown Event")
-    source = f"{cef_event.get('deviceVendor', '')} - {cef_event.get('deviceProduct', '')}".strip(" -")
-    severity = int(cef_event.get("severity", 2))
+def map_severity(fortisiem_sev):
+    """ Maps FortiSIEM severity (0–10) to TheHive severity (1–4)."""
+    try:
+        sev = int(fortisiem_sev)
+    except (TypeError, ValueError):
+        return 2  # default to Medium if invalid
 
-    # Try to use incidentId from the parsed rawEvent JSON as sourceRef
+    if sev <= 4:
+        return 1  # Low
+    elif sev <= 7:
+        return 2  # Medium
+    elif sev <= 9:
+        return 3  # High
+    else:  # sev == 10
+        return 4  # Critical
+
+
+def create_alert(parsed_log):
+
+    prefix = clean_prefix(parsed_log.get("prefix", ""))
+    cef_event = parsed_log.get("cef_data", {})
     raw_event_data = cef_event.get("rawEvent_json", {})
-    source_ref = raw_event_data.get("incidentId") or cef_event.get("signatureID", str(datetime.now(timezone.utc).timestamp()))
 
+    extensions = cef_event.get("extensions", {})
+    source = f"{cef_event.get('deviceVendor', '')} - {cef_event.get('deviceProduct', '')}".strip(" -")
 
-    description = json.dumps(cef_event.get("rawEvent_json", {}), indent=2)
-    event_time = extensions.get("rt", datetime.now(timezone.utc).isoformat())
+    source_ref = raw_event_data.get("incidentId", 1234)
+    title = raw_event_data.get("_ruleName", "Unknown Event")
+    description = raw_event_data.get("ruleDescription", "Default description")
+    severity = map_severity(raw_event_data.get("eventSeverity", 2))
+
+    event_time = prefix
+    organization = extensions.get("cs2", "Default Organization")
 
     alert = {
         "title": title,
-        "description": f"CEF Event Details:\n\n{description}",
+        "description": f"Alert Description: {description}",
         "type": "external",
         "source": source or "FortiSIEM",
         "sourceRef": source_ref,
-        "severity": min(max((severity + 1), 1), 4),
+        "severity": severity,
         "tlp": 2,
-        "tags": extensions.get("tags", "fortisiem").split(','),
+        "tags": organization,
         "observables": [],
         "date": event_time
     }
@@ -151,22 +189,12 @@ def create_alert(cef_event):
 
 if __name__ == "__main__":
     cef_event = parse_cef(
-        'CEF: 0|Fortinet|FortiSIEM|ANY|1|PH_RULE_INAPPROPRIATE_WEB_TRAFFIC|5|cs1Label=SupervisorHostName cs1=fortisiem.is.co.ke cs2Label=CustomerName cs2=PREMIERCREDITUG cs3Label=IncidentDetail cs3=webCategory:Freeware and Software Downloads,  cs5Label=IncidentEventIDList cs5=4641522367539077482 cn1Label=CustomerID cn1=2010 cn2Label=IncidentID cn2=2068454 type=2 dvc=45.221.79.18 cnt=224 rt=1747221570 src=192.168.2.11 shost=HOST-192.168.2.11 rawEvent=<!-- PHBOX RULE ENGINE --><event name="phRuleIncident"><supervisorName>fortisiem.is.co.ke</supervisorName><deviceTime>1747221570</deviceTime><firstSeenTime>1746418920</firstSeenTime><count>224</count><durationMSec>600000</durationMSec><ruleId>937704</ruleId><_ruleName>Website access policy violation</_ruleName><ruleDescription>Network IPS or Security Gateway or Firewall detects inappropriate website access</ruleDescription><eventType>PH_RULE_INAPPROPRIATE_WEB_TRAFFIC</eventType><eventSeverity>5</eventSeverity><eventSeverityCat>MEDIUM</eventSeverityCat><phEventCategory>1</phEventCategory><phIncidentImpacts>Application</phIncidentImpacts><phIncidentCategory>Security</phIncidentCategory><phSubIncidentCategory>PH_RULE_SECURITY_Policy_Violation</phSubIncidentCategory><phCustId>2010</phCustId><incidentSrc>srcIpAddr:192.168.2.11, </incidentSrc><incidentTarget></incidentTarget><srcIpAddr>192.168.2.11</srcIpAddr><webCategory>Freeware and Software Downloads</webCategory><incidentDetail>webCategory:Freeware and Software Downloads, </incidentDetail><incidentRptIp>45.221.79.18</incidentRptIp><incidentRptDevName>Premier_Credit_FORTI</incidentRptDevName><incidentRptGeoCountry>Uganda</incidentRptGeoCountry><incidentRptGeoCountryCodeStr>UG</incidentRptGeoCountryCodeStr><incidentRptGeoState>Central</incidentRptGeoState><incidentRptGeoCity>Kampala</incidentRptGeoCity><incidentRptGeoOrg>SIMBANET-AS  TZ</incidentRptGeoOrg><incidentRptGeoLatitude>0.3476</incidentRptGeoLatitude><incidentRptGeoLongitude>32.58252</incidentRptGeoLongitude><triggerEventLists><triggerEvents subpatName="WebViolation">4641522367539077482</triggerEvents><triggerEventTypes subpatName="WebViolation">FortiGate-event-dns-ftgd-cat-block</triggerEventTypes></triggerEventLists><incidentId>2068454</incidentId></event>')
+        'May 14 14:19:36 10.254.1.2 CEF: 0|Fortinet|FortiSIEM|ANY|1|PH_RULE_INAPPROPRIATE_WEB_TRAFFIC|5|cs1Label=SupervisorHostName cs1=fortisiem.is.co.ke cs2Label=CustomerName cs2=PREMIERCREDITUG cs3Label=IncidentDetail cs3=webCategory:Freeware and Software Downloads,  cs5Label=IncidentEventIDList cs5=4641522367539077482 cn1Label=CustomerID cn1=2010 cn2Label=IncidentID cn2=2068454 type=2 dvc=45.221.79.18 cnt=224 rt=1747221570 src=192.168.2.11 shost=HOST-192.168.2.11 rawEvent=<!-- PHBOX RULE ENGINE --><event name="phRuleIncident"><supervisorName>fortisiem.is.co.ke</supervisorName><deviceTime>1747221570</deviceTime><firstSeenTime>1746418920</firstSeenTime><count>224</count><durationMSec>600000</durationMSec><ruleId>937704</ruleId><_ruleName>Website access policy violation</_ruleName><ruleDescription>Network IPS or Security Gateway or Firewall detects inappropriate website access</ruleDescription><eventType>PH_RULE_INAPPROPRIATE_WEB_TRAFFIC</eventType><eventSeverity>5</eventSeverity><eventSeverityCat>MEDIUM</eventSeverityCat><phEventCategory>1</phEventCategory><phIncidentImpacts>Application</phIncidentImpacts><phIncidentCategory>Security</phIncidentCategory><phSubIncidentCategory>PH_RULE_SECURITY_Policy_Violation</phSubIncidentCategory><phCustId>2010</phCustId><incidentSrc>srcIpAddr:192.168.2.11, </incidentSrc><incidentTarget></incidentTarget><srcIpAddr>192.168.2.11</srcIpAddr><webCategory>Freeware and Software Downloads</webCategory><incidentDetail>webCategory:Freeware and Software Downloads, </incidentDetail><incidentRptIp>45.221.79.18</incidentRptIp><incidentRptDevName>Premier_Credit_FORTI</incidentRptDevName><incidentRptGeoCountry>Uganda</incidentRptGeoCountry><incidentRptGeoCountryCodeStr>UG</incidentRptGeoCountryCodeStr><incidentRptGeoState>Central</incidentRptGeoState><incidentRptGeoCity>Kampala</incidentRptGeoCity><incidentRptGeoOrg>SIMBANET-AS  TZ</incidentRptGeoOrg><incidentRptGeoLatitude>0.3476</incidentRptGeoLatitude><incidentRptGeoLongitude>32.58252</incidentRptGeoLongitude><triggerEventLists><triggerEvents subpatName="WebViolation">4641522367539077482</triggerEvents><triggerEventTypes subpatName="WebViolation">FortiGate-event-dns-ftgd-cat-block</triggerEventTypes></triggerEventLists><incidentId>2068454</incidentId></event>')
 
-    print(f"CEF after parse: {cef_event}")
+    with open(r"C:\Users\Muhanji\Documents\parsed_output.txt", "w") as output:
+        output.write(json.dumps(cef_event, indent=2))
+
     alert = create_alert(cef_event)
 
-    with open(r"C:\Users\Muhanji\Documents\output.txt", "w") as output:
+    with open(r"C:\Users\Muhanji\Documents\alert_output.txt", "w") as output:
         output.write(json.dumps(alert, indent=2))
-
-
-
-    """print(f"Parsed CEF Event: {cef_event}")
-
-    # Extract rawEvent and parse it
-    raw_event = cef_event.get("extensions", {}).get("rawEvent", "")
-    if raw_event:
-        raw_event_json = parse_raw_event(raw_event)
-        print(f"Raw Event JSON: {json.dumps(raw_event_json, indent=2)}")
-    else:
-        print("No rawEvent found!")"""

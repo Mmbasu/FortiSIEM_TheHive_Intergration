@@ -6,6 +6,7 @@ import re
 import requests
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
 
 # Configuration(Loading environment variables)
 load_dotenv()
@@ -15,10 +16,16 @@ THEHIVE_API_KEY = os.getenv("THEHIVE_API_KEY")
 
 # Logging setup(Initializes Logging for status/debug info)
 logging.basicConfig(
-    filename="cef_to_thehive.log",
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("/var/log/thehive_cef_listener.log"),
+        logging.StreamHandler()
+    ]
 )
+
+# Thread pool for concurrent processing
+executor = ThreadPoolExecutor(max_workers=10)
 
 
 def parse_cef(cef_line):
@@ -107,13 +114,10 @@ def send_to_thehive(alert):
         "Content-Type": "application/json"
     }
 
-    # Log success or failure and also handles duplicates (409 responses) gracefully.
     try:
         response = requests.post(f"{THEHIVE_URL}/api/alert", headers=headers, json=alert, timeout=10)
         if response.status_code == 201:
             logging.info(f"Alert '{alert['title']}' successfully sent to TheHive.")
-        elif response.status_code == 409:
-            logging.warning(f"Duplicate alert '{alert['title']}' detected.")
         else:
             logging.error(f"TheHive API returned error: {response.status_code} {response.text}")
     except requests.RequestException as e:
@@ -131,7 +135,8 @@ def handle_syslog(data):
 class SyslogUDPHandler(socketserver.BaseRequestHandler):
     def handle(self):
         data = self.request[0].strip().decode("utf-8", errors="ignore")
-        handle_syslog(data)
+        # Submit to thread pool
+        executor.submit(handle_syslog, data)
 
 if __name__ == "__main__":
     HOST, PORT = "0.0.0.0", 5140
@@ -141,3 +146,4 @@ if __name__ == "__main__":
             server.serve_forever()
         except KeyboardInterrupt:
             logging.info("CEF listener shutting down.")
+            executor.shutdown(wait=True)
